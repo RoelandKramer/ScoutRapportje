@@ -1,18 +1,4 @@
 # app.py
-"""
-SciSports Scouting Form Generator
-
-- Search: input + Search (Enter submits), then select player. No limit/offset controls.
-- Season stats: FIXED season label TARGET_SEASON_LABEL ("2025/2026") and aggregated like SciSports UI:
-  - fetch all seasonIds matching that label
-  - query career-stats for those seasonIds
-  - if a "Total" competition row exists, use it
-  - else: for each competition take MAX (cumulative rows), then sum across competitions
-- Career totals: apply the same per-season logic across all seasons, then sum seasons.
-
-Fills placeholders including {MV}.
-"""
-
 from __future__ import annotations
 
 import json
@@ -49,15 +35,28 @@ class PlayerOption:
 
     def label(self) -> str:
         age_str = "?" if self.age is None else str(self.age)
-        pos = self.position or "UnknownPos"
-        club = self.club or "UnknownClub"
-        league = self.league or "UnknownLeague"
-        return f"{self.name} — {age_str} — {pos} — {club} ({league})"
+        return f"{self.name} — {age_str} — {self.position or 'UnknownPos'} — {self.club or 'UnknownClub'} ({self.league or 'UnknownLeague'})"
 
 
 # -----------------------------
-# Helpers
+# Position formatting
 # -----------------------------
+POSITION_ABBREV: Dict[str, str] = {
+    "Goalkeeper": "GK",
+    "RightBack": "RB",
+    "RightFullback": "RB",
+    "LeftBack": "LB",
+    "CentreBack": "CB",
+    "DefensiveMidfield": "DM",
+    "CentreMidfield": "CM",
+    "AttackingMidfield": "AM",
+    "RightWing": "RW",
+    "LeftWing": "LW",
+    "CentreForward": "ST",
+    "Striker": "ST",
+}
+
+
 def normalize_season_label(name: str) -> str:
     if not name:
         return ""
@@ -96,18 +95,37 @@ def _fmt_int(v: Any) -> str:
         return ""
 
 
-def _parse_iso_date_to_ddmmyyyy(value: Optional[str]) -> str:
+def _parse_iso_date_to_ddmmyyyy_slash(value: Optional[str]) -> str:
+    """
+    Outputs DD/MM/YYYY (slashes), e.g. 26/03/2004
+    """
     if not value:
         return ""
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.strftime("%d-%m-%Y")
+        return dt.strftime("%d/%m/%Y")
     except Exception:
         try:
             dt = datetime.strptime(value[:10], "%Y-%m-%d")
-            return dt.strftime("%d-%m-%Y")
+            return dt.strftime("%d/%m/%Y")
         except Exception:
             return value
+
+
+def _fmt_height_meters(height_cm: Any) -> str:
+    """
+    SciSports height appears to be centimeters (int), e.g. 187 -> "1.87 M"
+    """
+    try:
+        if height_cm is None:
+            return ""
+        cm = float(height_cm)
+        if cm <= 0:
+            return ""
+        meters = cm / 100.0
+        return f"{meters:.2f} M"
+    except Exception:
+        return ""
 
 
 def _fmt_money_eur(value: Any) -> str:
@@ -129,6 +147,17 @@ def _first_position(info: Dict[str, Any]) -> str:
     if isinstance(positions, list) and positions:
         return _as_text(positions[0])
     return ""
+
+
+def _position_abbrev(pos: str) -> str:
+    """
+    Converts e.g. 'AttackingMidfield' -> 'AM'.
+    Falls back to the original string if unknown.
+    """
+    pos = (pos or "").strip()
+    if not pos:
+        return ""
+    return POSITION_ABBREV.get(pos, pos)
 
 
 def _extract_int(d: Dict[str, Any], *paths: str) -> int:
@@ -270,7 +299,7 @@ def search_players(token: str, search_text: str) -> Tuple[int, List[PlayerOption
                 player_id=int(pid),
                 name=_as_text(info.get("name") or info.get("footballName") or ""),
                 age=info.get("age"),
-                position=_first_position(info),
+                position=_position_abbrev(_first_position(info)),
                 club=_as_text(team.get("name") or ""),
                 league=_as_text(league.get("name") or ""),
             )
@@ -300,7 +329,6 @@ def get_latest_transfer_fee(token: str, player_id: int) -> Optional[Dict[str, An
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_seasons_for_player(token: str, player_id: int) -> List[Dict[str, Any]]:
-    # Some SciSports endpoints behave differently with casing -> send both.
     return fetch_all_items(
         token,
         "/v2/seasons",
@@ -347,30 +375,16 @@ def _competition_key(it: Dict[str, Any]) -> str:
 
 def _is_total_row(it: Dict[str, Any]) -> bool:
     name = _competition_name_lower(it)
-    return name in {
-        "total",
-        "overall",
-        "all",
-        "all competitions",
-        "all competitions total",
-    }
+    return name in {"total", "overall", "all", "all competitions", "all competitions total"}
 
 
 def aggregate_career_stats_items_like_ui(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    """
-    Mimics the safe aggregation your old script used:
-    - Prefer a Total row if present (highest minutes wins)
-    - Else: MAX per competition (cumulative rows), then SUM competitions
-    """
     if not items:
         return {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
 
     total_rows = [it for it in items if _is_total_row(it)]
     if total_rows:
-        best = max(
-            total_rows,
-            key=lambda it: _extract_int(it, "stats.minutesPlayed", "stats.minutes"),
-        )
+        best = max(total_rows, key=lambda it: _extract_int(it, "stats.minutesPlayed", "stats.minutes"))
         return {
             "matches": _extract_int(best, "stats.matchesPlayed", "stats.matches", "stats.games"),
             "minutes": _extract_int(best, "stats.minutesPlayed", "stats.minutes"),
@@ -448,9 +462,6 @@ def compute_career_totals(token: str, player_id: int) -> Dict[str, int]:
     return totals
 
 
-# -----------------------------
-# Agency/Agent best-effort extraction
-# -----------------------------
 def extract_agent_and_agency(player_obj: Dict[str, Any]) -> Tuple[str, str]:
     contract = player_obj.get("contract") or {}
     info = player_obj.get("info") or {}
@@ -586,7 +597,7 @@ def apply_position_coloring(prs: Presentation, slide, ordered_positions: List[st
 
 
 # -----------------------------
-# Replacements mapping (includes MV)
+# Replacements mapping (DOB slashes, height meters, position abbrev)
 # -----------------------------
 def build_replacements(
     player: Dict[str, Any],
@@ -600,20 +611,23 @@ def build_replacements(
     contract = player.get("contract") or {}
 
     name = _as_text(info.get("footballName") or info.get("name") or "")
-    dob = _parse_iso_date_to_ddmmyyyy(_as_text(info.get("birthDate")))
+    dob = _parse_iso_date_to_ddmmyyyy_slash(_as_text(info.get("birthDate")))
     place = _as_text(info.get("birthPlace") or "")
 
     nats = info.get("nationalities") or []
     nat_names = [str(n.get("name", "")).strip() for n in nats if isinstance(n, dict) and n.get("name")]
     nationalities = ", ".join([n for n in nat_names if n])
 
-    height = _fmt_int(info.get("height"))
+    height = _fmt_height_meters(info.get("height"))
     preferred_foot = _as_text(info.get("preferredFoot") or "")
-    position = _first_position(info)
+
+    raw_position = _first_position(info)
+    position = _position_abbrev(raw_position)
+
     league_name = _as_text(league.get("name") or "")
     club_name = _as_text(team.get("name") or "")
 
-    contract_end = _parse_iso_date_to_ddmmyyyy(_as_text(contract.get("contractEnd")))
+    contract_end = _parse_iso_date_to_ddmmyyyy_slash(_as_text(contract.get("contractEnd")))
     mv = _fmt_money_eur(contract.get("marketValue"))
     tv = _fmt_money_eur(transfer_fee.get("valueEstimateEur")) if transfer_fee else ""
 
@@ -661,37 +675,6 @@ def build_replacements(
     return out
 
 
-# -----------------------------
-# UI
-# -----------------------------
-def render_player_card(p: PlayerOption) -> None:
-    age_str = "?" if p.age is None else str(p.age)
-    st.markdown(
-        """
-<style>
-.player-card {
-  border: 1px solid rgba(49, 51, 63, 0.2);
-  border-radius: 10px;
-  padding: 14px 16px;
-  background: rgba(255,255,255,0.02);
-}
-.player-name { font-size: 16px; font-weight: 700; line-height: 1.2; }
-.player-meta { margin-top: 6px; font-size: 13px; opacity: 0.85; }
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"""
-<div class="player-card">
-  <div class="player-name">{p.name}</div>
-  <div class="player-meta">{age_str} - {p.position or "UnknownPos"} - {p.club or "UnknownClub"} ({p.league or "Unknown"})</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
 def main() -> None:
     st.set_page_config(page_title="SciSports Scouting Form Generator", layout="centered")
     st.title("SciSports Scouting Form Generator")
@@ -718,7 +701,7 @@ def main() -> None:
         st.stop()
 
     with st.form("player_search_form", clear_on_submit=False):
-        q = st.text_input("Enter player name", placeholder="e.g. Mees Laros", key="player_search_q")
+        q = st.text_input("Enter player name", placeholder="e.g. Ibrahim El Kadiri")
         submitted = st.form_submit_button("Search")
 
     if submitted:
@@ -736,11 +719,9 @@ def main() -> None:
         st.info("Search to load players.")
         st.stop()
 
-    st.caption(f"Results: showing {len(options)} (API limit {SEARCH_LIMIT}).")
     selected_label = st.selectbox("Player", options=[o.label() for o in options], index=0)
     selected = next(o for o in options if o.label() == selected_label)
-    st.session_state["selected_player_id"] = selected.player_id
-    render_player_card(selected)
+    player_id = selected.player_id
 
     st.divider()
     st.subheader("3) Generate Scoutings Form")
@@ -751,59 +732,43 @@ def main() -> None:
 
     if st.button("Generate Scoutings Form", type="primary"):
         with st.spinner("Fetching data and generating PPTX..."):
-            try:
-                player_id = int(st.session_state["selected_player_id"])
-                player = get_player(token, player_id)
-                transfer_fee = get_latest_transfer_fee(token, player_id)
+            player = get_player(token, player_id)
+            transfer_fee = get_latest_transfer_fee(token, player_id)
 
-                season_label, season_ids, season_stats = compute_target_season_stats(token, player_id, TARGET_SEASON_LABEL)
-                career_stats = compute_career_totals(token, player_id)
+            season_label, season_ids, season_stats = compute_target_season_stats(token, player_id, TARGET_SEASON_LABEL)
+            career_stats = compute_career_totals(token, player_id)
 
-                if not season_ids:
-                    st.warning(f"No season IDs found for season == {TARGET_SEASON_LABEL}. Season stats will be 0.")
+            replacements = build_replacements(player, transfer_fee, season_stats, career_stats)
 
-                replacements = build_replacements(
-                    player=player,
-                    transfer_fee=transfer_fee,
-                    season_stats=season_stats,
-                    career_stats=career_stats,
-                )
+            positions = (player.get("info") or {}).get("positions") or []
+            preferred_foot = _as_text((player.get("info") or {}).get("preferredFoot") or "")
 
-                positions = (player.get("info") or {}).get("positions") or []
-                preferred_foot = _as_text((player.get("info") or {}).get("preferredFoot") or "")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
+                out_path = tmp.name
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
-                    out_path = tmp.name
+            fill_pptx(
+                template_path=TEMPLATE_PATH,
+                output_path=out_path,
+                replacements=replacements,
+                positions=[_as_text(p) for p in positions if p],
+                preferred_foot=preferred_foot,
+            )
 
-                fill_pptx(
-                    template_path=TEMPLATE_PATH,
-                    output_path=out_path,
-                    replacements=replacements,
-                    positions=[_as_text(p) for p in positions if p],
-                    preferred_foot=preferred_foot,
-                )
+            with open(out_path, "rb") as f:
+                ppt_bytes = f.read()
 
-                with open(out_path, "rb") as f:
-                    ppt_bytes = f.read()
+            safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", (player.get("info") or {}).get("name") or "player")[:80]
+            out_filename = f"ScoutingsRapport_{safe_name}_{player_id}.pptx"
 
-                safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", (player.get("info") or {}).get("name") or "player")[:80]
-                out_filename = f"ScoutingsRapport_{safe_name}_{player_id}.pptx"
+            st.download_button(
+                "Download filled Scoutings Rapport (.pptx)",
+                data=ppt_bytes,
+                file_name=out_filename,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
 
-                st.success("Generated ✅")
-                st.caption(f"Season stats used: {season_label} (seasonIds={season_ids})")
-
-                st.download_button(
-                    "Download filled Scoutings Rapport (.pptx)",
-                    data=ppt_bytes,
-                    file_name=out_filename,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                )
-
-                with st.expander("Filled values (debug)"):
-                    st.json(replacements)
-
-            except Exception as e:
-                st.error(f"Failed to generate PPTX: {e}")
+            with st.expander("Filled values (debug)"):
+                st.json(replacements)
 
 
 if __name__ == "__main__":
