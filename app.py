@@ -16,14 +16,28 @@ SCISPORTS_CLIENT_SECRET="..."
 SCISPORTS_SCOPE="api recruitment"  # optional
 
 Search UX:
-- Type a name -> press Search (or Enter) -> pick player
+- Type a name -> press Search (or Enter) -> pick player (no limit/offset controls)
 
 Stats logic:
-- "Last season" = latest season label from /seasons?playerIds=...
-- Aggregate across ALL season IDs for that season label:
-  - matches/minutes from contribution-ratings
-  - goals/assists from career-stats
-- Career totals aggregated from career-stats across all seasons.
+- Season stats are computed for a FIXED season label: TARGET_SEASON_LABEL (default "2025/2026")
+- We sum across ALL season IDs that normalize to that label (multiple competitions per season label).
+  - matches/minutes from contribution-ratings (MAX per competition, then SUM)
+  - goals/assists from career-stats (MAX per competition, then SUM)
+- Career totals aggregated from career-stats across all seasons similarly.
+
+Template placeholders filled:
+{Name}
+{ DD/MM/YYYY }   (Date of birth)
+{ Place }        (Birth place/city)
+{Nationalities}  (nationalities joined)
+{ Height }
+{ Preferred Foot }
+{ Position }
+{ League }
+{ Club }
+{Season_m} {season_min} {season_g} {season_a}
+{Career_m} {career_min} {career_g} {career_a}
+{con_DD/MM/YYYY} {TV} {MV} {Agency} {Agent}
 """
 
 from __future__ import annotations
@@ -34,7 +48,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -47,6 +61,10 @@ TEMPLATE_PATH = "TemplateScoutingsRapport.pptx"
 
 SEARCH_LIMIT = 50
 SEARCH_OFFSET = 0
+
+TARGET_SEASON_LABEL = "2025/2026"  # <- fixed as requested
+
+SEASON_RE = re.compile(r"\b(20\d{2})\s*[/\-]\s*(\d{2}|20\d{2})\b")
 
 
 # -----------------------------
@@ -70,19 +88,9 @@ class PlayerOption:
 
 
 # -----------------------------
-# Basic helpers
+# Helpers
 # -----------------------------
-SEASON_RE = re.compile(r"\b(20\d{2})\s*[/\-]\s*(\d{2}|20\d{2})\b")
-
-
 def normalize_season_label(name: str) -> str:
-    """
-    Normalize season strings to 'YYYY/YYYY' when possible.
-    Examples:
-      '2024/2025' -> '2024/2025'
-      '2024-2025' -> '2024/2025'
-      '2024/25'   -> '2024/2025'
-    """
     if not name:
         return ""
     m = SEASON_RE.search(str(name))
@@ -210,16 +218,12 @@ def fetch_all_items(
     params: Dict[str, Any],
     *,
     page_limit: int = 200,
-    hard_cap: int = 10_000,
+    hard_cap: int = 50_000,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetches all pages for endpoints that support offset/limit and return {total, items}.
-    """
     s = _http_session()
     out: List[Dict[str, Any]] = []
     offset = int(params.get("offset", 0))
-    limit = int(params.get("limit", page_limit))
-    limit = min(max(limit, 1), page_limit)
+    limit = min(max(int(params.get("limit", page_limit)), 1), page_limit)
 
     while True:
         p = dict(params)
@@ -238,9 +242,8 @@ def fetch_all_items(
         out.extend([it for it in items if isinstance(it, dict)])
 
         total = payload.get("total")
-        if isinstance(total, int):
-            if len(out) >= total:
-                break
+        if isinstance(total, int) and len(out) >= total:
+            break
         if not items:
             break
 
@@ -320,45 +323,26 @@ def get_latest_transfer_fee(access_token: str, player_id: int) -> Optional[Dict[
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_seasons_for_player(access_token: str, player_id: int) -> List[Dict[str, Any]]:
-    """
-    SciSports appears to support PlayerIds on seasons endpoint (as in your older script).
-    """
-    items = fetch_all_items(
+    return fetch_all_items(
         access_token,
         "/v2/seasons",
         params={"offset": 0, "limit": 200, "playerIds": player_id},
         page_limit=200,
         hard_cap=5000,
     )
-    return items
 
 
-def pick_latest_season_label(seasons: List[Dict[str, Any]]) -> Tuple[str, List[int]]:
-    """
-    Returns (season_label, season_ids_for_that_label).
-    Uses endDate/startDate sorting, then groups by normalized season label.
-    """
-    rows: List[Tuple[str, str, int]] = []
+def season_ids_for_label(seasons: List[Dict[str, Any]], label: str) -> List[int]:
+    target = normalize_season_label(label)
+    out: List[int] = []
     for it in seasons:
         sid = it.get("id")
         if not isinstance(sid, int):
             continue
-        label = normalize_season_label(_as_text(it.get("name") or ""))
-        if not label:
-            continue
-        end_date = _as_text(it.get("endDate") or "")
-        start_date = _as_text(it.get("startDate") or "")
-        sort_key = end_date or start_date or ""
-        rows.append((label, sort_key, sid))
-
-    if not rows:
-        return "", []
-
-    rows.sort(key=lambda t: t[1])  # ascending by date string
-    latest_label = rows[-1][0]
-    season_ids = [sid for (lab, _k, sid) in rows if lab == latest_label]
-    season_ids = sorted(list(set(season_ids)))
-    return latest_label, season_ids
+        name = normalize_season_label(_as_text(it.get("name") or ""))
+        if name == target:
+            out.append(sid)
+    return sorted(list(set(out)))
 
 
 def _competition_key(item: Dict[str, Any]) -> str:
@@ -392,10 +376,6 @@ def _extract_int(d: Dict[str, Any], *paths: str) -> int:
 
 
 def aggregate_season_from_contribution_ratings(access_token: str, player_id: int, season_ids: List[int]) -> Dict[str, int]:
-    """
-    Matches/minutes from contribution-ratings.
-    We guard against duplicates by using MAX per competition then SUM across competitions.
-    """
     if not season_ids:
         return {"matches": 0, "minutes": 0}
 
@@ -433,10 +413,6 @@ def aggregate_season_from_contribution_ratings(access_token: str, player_id: int
 
 
 def aggregate_season_from_career_stats(access_token: str, player_id: int, season_ids: List[int]) -> Dict[str, int]:
-    """
-    Goals/assists (and also matches/minutes if needed) from career-stats.
-    Again, MAX per competition then SUM across competitions.
-    """
     if not season_ids:
         return {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
 
@@ -473,16 +449,16 @@ def aggregate_season_from_career_stats(access_token: str, player_id: int, season
     }
 
 
-def compute_last_season_stats(access_token: str, player_id: int) -> Tuple[str, Dict[str, int]]:
+def compute_target_season_stats(access_token: str, player_id: int, season_label: str) -> Tuple[str, List[int], Dict[str, int]]:
     seasons = get_seasons_for_player(access_token, player_id)
-    label, season_ids = pick_latest_season_label(seasons)
-    if not label:
-        return "", {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
+    season_ids = season_ids_for_label(seasons, season_label)
+    if not season_ids:
+        return season_label, [], {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
 
     gm = aggregate_season_from_contribution_ratings(access_token, player_id, season_ids)
     ga = aggregate_season_from_career_stats(access_token, player_id, season_ids)
 
-    return label, {
+    return season_label, season_ids, {
         "matches": gm["matches"] or ga["matches"],
         "minutes": gm["minutes"] or ga["minutes"],
         "goals": ga["goals"],
@@ -491,11 +467,6 @@ def compute_last_season_stats(access_token: str, player_id: int) -> Tuple[str, D
 
 
 def compute_career_totals(access_token: str, player_id: int) -> Dict[str, int]:
-    """
-    Career totals from career-stats across all seasons, avoiding double counting:
-    - Group by seasonId, then per season do MAX-per-competition then SUM.
-    - Finally sum across seasons.
-    """
     items = fetch_all_items(
         access_token,
         "/v2/metrics/career-stats/players",
@@ -568,7 +539,6 @@ def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> None:
         if not paragraph.runs:
             continue
 
-        # Run-level replace
         for run in paragraph.runs:
             t = run.text or ""
             if "{" not in t:
@@ -580,7 +550,6 @@ def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> None:
             if new_t != t:
                 run.text = new_t
 
-        # Cross-run replace
         combined = "".join((r.text or "") for r in paragraph.runs)
         if "{" not in combined:
             continue
@@ -614,10 +583,8 @@ POSITION_TO_NUMBER: Dict[str, int] = {
     "Goalkeeper": 1,
     "RightBack": 2,
     "RightFullback": 2,
-    "Right Wing": 7,
     "RightWing": 7,
     "LeftBack": 5,
-    "Left Wing": 11,
     "LeftWing": 11,
     "CentreMidfield": 8,
     "AttackingMidfield": 10,
@@ -654,7 +621,6 @@ def apply_position_coloring(prs: Presentation, slide, ordered_positions: List[st
     W = prs.slide_width
     H = prs.slide_height
 
-    # bottom-left area filter (tune if needed)
     x_max = int(W * 0.50)
     y_min = int(H * 0.55)
 
@@ -709,12 +675,11 @@ def build_replacements(
     club_name = _as_text(team.get("name") or "")
 
     contract_end = _parse_iso_date_to_ddmmyyyy(_as_text(contract.get("contractEnd")))
-    market_value = _fmt_money_eur(contract.get("marketValue"))
+    mv = _fmt_money_eur(contract.get("marketValue"))  # <- MV included
     tv = _fmt_money_eur(transfer_fee.get("valueEstimateEur")) if transfer_fee else ""
 
     agency, agent = extract_agent_and_agency(player)
 
-    # Tolerate spacing variants
     def variants(token: str) -> List[str]:
         inner = token.strip("{}").strip()
         return list({f"{{{inner}}}", f"{{ {inner} }}", token})
@@ -745,7 +710,7 @@ def build_replacements(
         ("{career_a}", _fmt_int(career_stats.get("assists"))),
         ("{con_DD/MM/YYYY}", contract_end),
         ("{TV}", tv),
-        ("{MV}", market_value),
+        ("{MV}", mv),
         ("{Agency}", agency),
         ("{Agent}", agent),
     ]
@@ -829,17 +794,15 @@ def main() -> None:
                 st.error(f"Player search failed: {e}")
 
     options: List[PlayerOption] = st.session_state.get("player_options", [])
-    total = int(st.session_state.get("player_total", 0))
-
-    if options:
-        st.caption(f"Results: showing {len(options)} (API limit {SEARCH_LIMIT}).")
-        selected_label = st.selectbox("Player", options=[o.label() for o in options], index=0)
-        selected = next(o for o in options if o.label() == selected_label)
-        st.session_state["selected_player_id"] = selected.player_id
-        render_player_card(selected)
-    else:
+    if not options:
         st.info("Search to load players.")
         st.stop()
+
+    st.caption(f"Results: showing {len(options)} (API limit {SEARCH_LIMIT}).")
+    selected_label = st.selectbox("Player", options=[o.label() for o in options], index=0)
+    selected = next(o for o in options if o.label() == selected_label)
+    st.session_state["selected_player_id"] = selected.player_id
+    render_player_card(selected)
 
     st.divider()
     st.subheader("3) Generate Scoutings Form")
@@ -855,13 +818,16 @@ def main() -> None:
                 player = get_player(token, player_id)
                 transfer_fee = get_latest_transfer_fee(token, player_id)
 
-                last_season_label, last_season_stats = compute_last_season_stats(token, player_id)
+                season_label, season_ids, season_stats = compute_target_season_stats(token, player_id, TARGET_SEASON_LABEL)
                 career_stats = compute_career_totals(token, player_id)
+
+                if not season_ids:
+                    st.warning(f"No season IDs found for season == {TARGET_SEASON_LABEL}. Season stats will be 0.")
 
                 replacements = build_replacements(
                     player=player,
                     transfer_fee=transfer_fee,
-                    season_stats=last_season_stats,
+                    season_stats=season_stats,
                     career_stats=career_stats,
                 )
 
@@ -886,8 +852,7 @@ def main() -> None:
                 out_filename = f"ScoutingsRapport_{safe_name}_{player_id}.pptx"
 
                 st.success("Generated ✅")
-                if last_season_label:
-                    st.caption(f"Last season detected: {last_season_label}")
+                st.caption(f"Season stats used: {season_label} (seasonIds={season_ids})")
 
                 st.download_button(
                     "Download filled Scoutings Rapport (.pptx)",
