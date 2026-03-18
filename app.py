@@ -13,25 +13,17 @@ SCISPORTS_USERNAME="..."
 SCISPORTS_PASSWORD="..."
 SCISPORTS_CLIENT_ID="..."
 SCISPORTS_CLIENT_SECRET="..."
-SCISPORTS_SCOPE="api recruitment"  # optional (defaults to this)
+SCISPORTS_SCOPE="api recruitment"  # optional
 
-Template placeholders (detected in TemplateScoutingsRapport.pptx):
-{Name}
-{ DD/MM/YYYY }
-{ Place }
-{Nationalities}
-{ Height }
-{ Preferred Foot }
-{ Position }
-{ League }
-{ Club }
-{Season_m} {season_min} {season_g} {season_a}
-{Career_m} {career_min} {career_g} {career_a}
-{con_DD/MM/YYYY} {TV} {MV} {Agency} {Agent}
+Search UX:
+- Type a name -> press Search (or Enter) -> pick player
 
-Notes:
-- Token replacement handles placeholders split across PowerPoint runs (common PPTX quirk).
-- Position coloring colors the "1..11" position boxes in the bottom-left area.
+Stats logic:
+- "Last season" = latest season label from /seasons?playerIds=...
+- Aggregate across ALL season IDs for that season label:
+  - matches/minutes from contribution-ratings
+  - goals/assists from career-stats
+- Career totals aggregated from career-stats across all seasons.
 """
 
 from __future__ import annotations
@@ -42,7 +34,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -53,8 +45,8 @@ API_BASE = "https://api-recruitment.scisports.app/api"
 TOKEN_URL = "https://identity.scisports.app/connect/token"
 TEMPLATE_PATH = "TemplateScoutingsRapport.pptx"
 
-# Hardcode; you said context is not needed. Keep if API requires it, else we omit.
-DEFAULT_CONTEXT: Optional[str] = None  # set to "Male" if SciSports requires the param
+SEARCH_LIMIT = 50
+SEARCH_OFFSET = 0
 
 
 # -----------------------------
@@ -78,8 +70,35 @@ class PlayerOption:
 
 
 # -----------------------------
-# HTTP helpers
+# Basic helpers
 # -----------------------------
+SEASON_RE = re.compile(r"\b(20\d{2})\s*[/\-]\s*(\d{2}|20\d{2})\b")
+
+
+def normalize_season_label(name: str) -> str:
+    """
+    Normalize season strings to 'YYYY/YYYY' when possible.
+    Examples:
+      '2024/2025' -> '2024/2025'
+      '2024-2025' -> '2024/2025'
+      '2024/25'   -> '2024/2025'
+    """
+    if not name:
+        return ""
+    m = SEASON_RE.search(str(name))
+    if not m:
+        return ""
+    y1 = int(m.group(1))
+    y2_raw = m.group(2)
+    if len(y2_raw) == 2:
+        y2 = (y1 // 100) * 100 + int(y2_raw)
+        if y2 < y1:
+            y2 += 100
+    else:
+        y2 = int(y2_raw)
+    return f"{y1}/{y2}"
+
+
 def _http_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"Accept": "application/json"})
@@ -90,24 +109,29 @@ def _auth_headers(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
 
-def _safe_get(d: Any, path: str, default: Any = None) -> Any:
-    cur = d
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur[part]
-    return cur
+def _as_text(v: Any) -> str:
+    return "" if v is None else str(v)
 
 
-def _as_text(value: Any) -> str:
-    return "" if value is None else str(value)
-
-
-def _fmt_int(value: Any) -> str:
+def _fmt_int(v: Any) -> str:
     try:
-        return "" if value is None else str(int(value))
+        return "" if v is None else str(int(v))
     except Exception:
         return ""
+
+
+def _parse_iso_date_to_ddmmyyyy(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        try:
+            dt = datetime.strptime(value[:10], "%Y-%m-%d")
+            return dt.strftime("%d-%m-%Y")
+        except Exception:
+            return value
 
 
 def _fmt_money_eur(value: Any) -> str:
@@ -122,21 +146,6 @@ def _fmt_money_eur(value: Any) -> str:
         return f"€ {v:.0f}"
     except Exception:
         return ""
-
-
-def _parse_iso_date_to_ddmmyyyy(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    # Handles "YYYY-MM-DD" and ISO datetimes
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.strftime("%d-%m-%Y")
-    except Exception:
-        try:
-            dt = datetime.strptime(value[:10], "%Y-%m-%d")
-            return dt.strftime("%d-%m-%Y")
-        except Exception:
-            return value
 
 
 def _first_position(info: Dict[str, Any]) -> str:
@@ -193,19 +202,62 @@ def token_password_grant_from_secrets(timeout_s: int = 30) -> str:
 
 
 # -----------------------------
-# SciSports API
+# Pagination helper
+# -----------------------------
+def fetch_all_items(
+    access_token: str,
+    path: str,
+    params: Dict[str, Any],
+    *,
+    page_limit: int = 200,
+    hard_cap: int = 10_000,
+) -> List[Dict[str, Any]]:
+    """
+    Fetches all pages for endpoints that support offset/limit and return {total, items}.
+    """
+    s = _http_session()
+    out: List[Dict[str, Any]] = []
+    offset = int(params.get("offset", 0))
+    limit = int(params.get("limit", page_limit))
+    limit = min(max(limit, 1), page_limit)
+
+    while True:
+        p = dict(params)
+        p["offset"] = offset
+        p["limit"] = limit
+
+        url = f"{API_BASE}{path}"
+        resp = s.get(url, headers=_auth_headers(access_token), params=p, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        items = payload.get("items") or []
+        if not isinstance(items, list):
+            break
+
+        out.extend([it for it in items if isinstance(it, dict)])
+
+        total = payload.get("total")
+        if isinstance(total, int):
+            if len(out) >= total:
+                break
+        if not items:
+            break
+
+        offset += limit
+        if len(out) >= hard_cap:
+            break
+
+    return out
+
+
+# -----------------------------
+# SciSports API (players)
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 15)
-def search_players(
-    access_token: str,
-    search_text: str,
-    limit: int,
-    offset: int,
-) -> Tuple[int, List[PlayerOption]]:
+def search_players(access_token: str, search_text: str) -> Tuple[int, List[PlayerOption]]:
     s = _http_session()
-    params: Dict[str, Any] = {"offset": offset, "limit": limit}
-    if DEFAULT_CONTEXT:
-        params["context"] = DEFAULT_CONTEXT
+    params: Dict[str, Any] = {"offset": SEARCH_OFFSET, "limit": SEARCH_LIMIT}
     if search_text.strip():
         params["searchText"] = search_text.strip()
 
@@ -225,7 +277,6 @@ def search_players(
         pid = info.get("id")
         if pid is None:
             continue
-
         options.append(
             PlayerOption(
                 player_id=int(pid),
@@ -257,8 +308,6 @@ def get_latest_transfer_fee(access_token: str, player_id: int) -> Optional[Dict[
         "playerIds": player_id,
         "latestTransferFee": "true",
     }
-    if DEFAULT_CONTEXT:
-        params["context"] = DEFAULT_CONTEXT
     resp = s.get(url, headers=_auth_headers(access_token), params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -266,138 +315,260 @@ def get_latest_transfer_fee(access_token: str, player_id: int) -> Optional[Dict[
     return items[0] if items else None
 
 
-def get_career_stats_all(access_token: str, player_id: int) -> List[Dict[str, Any]]:
+# -----------------------------
+# Seasons + stats aggregation
+# -----------------------------
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_seasons_for_player(access_token: str, player_id: int) -> List[Dict[str, Any]]:
     """
-    Fetch all career-stats items for a player (paginates).
-    We then derive:
-      - "this season": latest season by season.startDate
-      - "career": sum across all returned seasons
+    SciSports appears to support PlayerIds on seasons endpoint (as in your older script).
     """
-    s = _http_session()
-    offset = 0
-    limit = 100
-    items: List[Dict[str, Any]] = []
-
-    candidates = [
-        f"{API_BASE}/v2/metrics/career-stats/players",
-        f"{API_BASE}/v2/metrics/career-stats/Players",
-    ]
-    url = None
-    for c in candidates:
-        try:
-            test = s.get(
-                c,
-                headers=_auth_headers(access_token),
-                params={"offset": 0, "limit": 1, "playerIds": player_id},
-                timeout=30,
-            )
-            if test.status_code < 400:
-                url = c
-                break
-        except Exception:
-            pass
-    if not url:
-        raise RuntimeError("Could not reach career-stats endpoint.")
-
-    while True:
-        params: Dict[str, Any] = {"offset": offset, "limit": limit, "playerIds": player_id}
-        if DEFAULT_CONTEXT:
-            params["context"] = DEFAULT_CONTEXT
-        resp = s.get(url, headers=_auth_headers(access_token), params=params, timeout=30)
-        resp.raise_for_status()
-        payload = resp.json()
-        batch = payload.get("items") or []
-        items.extend(batch)
-
-        total = int(payload.get("total", len(items)))
-        offset += limit
-        if len(items) >= total or not batch:
-            break
-
+    items = fetch_all_items(
+        access_token,
+        "/v2/seasons",
+        params={"offset": 0, "limit": 200, "playerIds": player_id},
+        page_limit=200,
+        hard_cap=5000,
+    )
     return items
 
 
-def summarize_season_and_career(items: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, int], Optional[Dict[str, Any]]]:
+def pick_latest_season_label(seasons: List[Dict[str, Any]]) -> Tuple[str, List[int]]:
     """
-    Returns:
-      (latest_season_stats, career_total_stats, latest_item)
-
-    Keys:
-      matches, minutes, goals, assists
+    Returns (season_label, season_ids_for_that_label).
+    Uses endDate/startDate sorting, then groups by normalized season label.
     """
-    def extract_stats(it: Dict[str, Any]) -> Dict[str, int]:
-        stats = it.get("stats") or {}
-        return {
-            "matches": int(stats.get("matchesPlayed", 0) or 0),
-            "minutes": int(stats.get("minutesPlayed", 0) or 0),
-            "goals": int(stats.get("goal", 0) or 0),
-            "assists": int(stats.get("assist", 0) or 0),
-        }
+    rows: List[Tuple[str, str, int]] = []
+    for it in seasons:
+        sid = it.get("id")
+        if not isinstance(sid, int):
+            continue
+        label = normalize_season_label(_as_text(it.get("name") or ""))
+        if not label:
+            continue
+        end_date = _as_text(it.get("endDate") or "")
+        start_date = _as_text(it.get("startDate") or "")
+        sort_key = end_date or start_date or ""
+        rows.append((label, sort_key, sid))
 
-    def season_sort_key(it: Dict[str, Any]) -> str:
-        season = it.get("season") or {}
-        sd = season.get("startDate")
-        return sd if isinstance(sd, str) else ""
+    if not rows:
+        return "", []
 
-    if not items:
-        z = {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
-        return z, z, None
+    rows.sort(key=lambda t: t[1])  # ascending by date string
+    latest_label = rows[-1][0]
+    season_ids = [sid for (lab, _k, sid) in rows if lab == latest_label]
+    season_ids = sorted(list(set(season_ids)))
+    return latest_label, season_ids
 
-    latest_item = sorted(items, key=season_sort_key)[-1]
-    latest = extract_stats(latest_item)
 
-    career = {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
+def _competition_key(item: Dict[str, Any]) -> str:
+    comp = item.get("competition") or item.get("competitionGroup") or item.get("league") or {}
+    if isinstance(comp, dict):
+        cid = comp.get("id")
+        if cid is not None:
+            return f"id:{cid}"
+        cname = _as_text(comp.get("name") or "").strip().lower()
+        if cname:
+            return f"name:{cname}"
+    cname2 = _as_text(item.get("competitionName") or item.get("leagueName") or "").strip().lower()
+    return f"name:{cname2}" if cname2 else "unknown"
+
+
+def _extract_int(d: Dict[str, Any], *paths: str) -> int:
+    for p in paths:
+        cur: Any = d
+        ok = True
+        for part in p.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and cur is not None:
+            try:
+                return int(round(float(cur)))
+            except Exception:
+                pass
+    return 0
+
+
+def aggregate_season_from_contribution_ratings(access_token: str, player_id: int, season_ids: List[int]) -> Dict[str, int]:
+    """
+    Matches/minutes from contribution-ratings.
+    We guard against duplicates by using MAX per competition then SUM across competitions.
+    """
+    if not season_ids:
+        return {"matches": 0, "minutes": 0}
+
+    items = fetch_all_items(
+        access_token,
+        "/v2/metrics/players/contribution-ratings",
+        params={
+            "offset": 0,
+            "limit": 200,
+            "playerIds": player_id,
+            "seasonIds": season_ids,
+            "percentile": "False",
+            "statsCategories": "Basic",
+        },
+        page_limit=200,
+        hard_cap=5000,
+    )
+
+    best_per_comp: Dict[str, Dict[str, int]] = {}
     for it in items:
-        s = extract_stats(it)
-        for k in career:
-            career[k] += s[k]
+        ck = _competition_key(it)
+        matches = _extract_int(it, "stats.matchesPlayed", "stats.matches", "stats.games")
+        minutes = _extract_int(it, "stats.minutesPlayed", "stats.minutes")
+        prev = best_per_comp.get(ck)
+        if prev is None:
+            best_per_comp[ck] = {"matches": matches, "minutes": minutes}
+        else:
+            prev["matches"] = max(prev["matches"], matches)
+            prev["minutes"] = max(prev["minutes"], minutes)
 
-    return latest, career, latest_item
+    return {
+        "matches": sum(v["matches"] for v in best_per_comp.values()),
+        "minutes": sum(v["minutes"] for v in best_per_comp.values()),
+    }
+
+
+def aggregate_season_from_career_stats(access_token: str, player_id: int, season_ids: List[int]) -> Dict[str, int]:
+    """
+    Goals/assists (and also matches/minutes if needed) from career-stats.
+    Again, MAX per competition then SUM across competitions.
+    """
+    if not season_ids:
+        return {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
+
+    items = fetch_all_items(
+        access_token,
+        "/v2/metrics/career-stats/players",
+        params={"offset": 0, "limit": 200, "playerIds": player_id, "seasonIds": season_ids},
+        page_limit=200,
+        hard_cap=10_000,
+    )
+
+    best_per_comp: Dict[str, Dict[str, int]] = {}
+    for it in items:
+        ck = _competition_key(it)
+        matches = _extract_int(it, "stats.matchesPlayed", "stats.matches", "stats.games")
+        minutes = _extract_int(it, "stats.minutesPlayed", "stats.minutes")
+        goals = _extract_int(it, "stats.goal", "stats.goals", "stats.goalNonPenalty")
+        assists = _extract_int(it, "stats.assist", "stats.assists")
+
+        prev = best_per_comp.get(ck)
+        if prev is None:
+            best_per_comp[ck] = {"matches": matches, "minutes": minutes, "goals": goals, "assists": assists}
+        else:
+            prev["matches"] = max(prev["matches"], matches)
+            prev["minutes"] = max(prev["minutes"], minutes)
+            prev["goals"] = max(prev["goals"], goals)
+            prev["assists"] = max(prev["assists"], assists)
+
+    return {
+        "matches": sum(v["matches"] for v in best_per_comp.values()),
+        "minutes": sum(v["minutes"] for v in best_per_comp.values()),
+        "goals": sum(v["goals"] for v in best_per_comp.values()),
+        "assists": sum(v["assists"] for v in best_per_comp.values()),
+    }
+
+
+def compute_last_season_stats(access_token: str, player_id: int) -> Tuple[str, Dict[str, int]]:
+    seasons = get_seasons_for_player(access_token, player_id)
+    label, season_ids = pick_latest_season_label(seasons)
+    if not label:
+        return "", {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
+
+    gm = aggregate_season_from_contribution_ratings(access_token, player_id, season_ids)
+    ga = aggregate_season_from_career_stats(access_token, player_id, season_ids)
+
+    return label, {
+        "matches": gm["matches"] or ga["matches"],
+        "minutes": gm["minutes"] or ga["minutes"],
+        "goals": ga["goals"],
+        "assists": ga["assists"],
+    }
+
+
+def compute_career_totals(access_token: str, player_id: int) -> Dict[str, int]:
+    """
+    Career totals from career-stats across all seasons, avoiding double counting:
+    - Group by seasonId, then per season do MAX-per-competition then SUM.
+    - Finally sum across seasons.
+    """
+    items = fetch_all_items(
+        access_token,
+        "/v2/metrics/career-stats/players",
+        params={"offset": 0, "limit": 200, "playerIds": player_id},
+        page_limit=200,
+        hard_cap=50_000,
+    )
+
+    by_season: Dict[int, List[Dict[str, Any]]] = {}
+    for it in items:
+        sid = it.get("seasonId") or (it.get("season") or {}).get("id")
+        if isinstance(sid, int):
+            by_season.setdefault(sid, []).append(it)
+
+    totals = {"matches": 0, "minutes": 0, "goals": 0, "assists": 0}
+
+    for _sid, season_items in by_season.items():
+        best_per_comp: Dict[str, Dict[str, int]] = {}
+        for it in season_items:
+            ck = _competition_key(it)
+            matches = _extract_int(it, "stats.matchesPlayed", "stats.matches", "stats.games")
+            minutes = _extract_int(it, "stats.minutesPlayed", "stats.minutes")
+            goals = _extract_int(it, "stats.goal", "stats.goals", "stats.goalNonPenalty")
+            assists = _extract_int(it, "stats.assist", "stats.assists")
+
+            prev = best_per_comp.get(ck)
+            if prev is None:
+                best_per_comp[ck] = {"matches": matches, "minutes": minutes, "goals": goals, "assists": assists}
+            else:
+                prev["matches"] = max(prev["matches"], matches)
+                prev["minutes"] = max(prev["minutes"], minutes)
+                prev["goals"] = max(prev["goals"], goals)
+                prev["assists"] = max(prev["assists"], assists)
+
+        totals["matches"] += sum(v["matches"] for v in best_per_comp.values())
+        totals["minutes"] += sum(v["minutes"] for v in best_per_comp.values())
+        totals["goals"] += sum(v["goals"] for v in best_per_comp.values())
+        totals["assists"] += sum(v["assists"] for v in best_per_comp.values())
+
+    return totals
 
 
 # -----------------------------
-# Agency / agent extraction (best-effort)
+# Agency/Agent best-effort extraction
 # -----------------------------
 def extract_agent_and_agency(player_obj: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    SciSports fields may differ per contract model; try a few common patterns.
-    Returns (agency, agent).
-    """
     contract = player_obj.get("contract") or {}
     info = player_obj.get("info") or {}
-
-    # Common guesses
     agency = (
         _as_text(contract.get("agencyName"))
-        or _as_text(_safe_get(contract, "agency.name", ""))
+        or _as_text((contract.get("agency") or {}).get("name") if isinstance(contract.get("agency"), dict) else "")
         or _as_text(info.get("agencyName"))
-        or _as_text(_safe_get(info, "agency.name", ""))
     )
     agent = (
         _as_text(contract.get("agentName"))
-        or _as_text(_safe_get(contract, "agent.name", ""))
+        or _as_text((contract.get("agent") or {}).get("name") if isinstance(contract.get("agent"), dict) else "")
         or _as_text(info.get("agentName"))
-        or _as_text(_safe_get(info, "agent.name", ""))
     )
-
     return agency.strip(), agent.strip()
 
 
 # -----------------------------
-# PPTX placeholder replacement (run-safe)
+# PPTX replacement (handles split-runs)
 # -----------------------------
-TOKEN_RE = re.compile(r"\{[^{}]+\}")
-
-def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> bool:
+def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> None:
     if not getattr(shape, "has_text_frame", False):
-        return False
+        return
 
-    changed = False
     for paragraph in shape.text_frame.paragraphs:
         if not paragraph.runs:
             continue
 
-        # 1) run-level replace
+        # Run-level replace
         for run in paragraph.runs:
             t = run.text or ""
             if "{" not in t:
@@ -408,13 +579,11 @@ def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> bool:
                     new_t = new_t.replace(k, v)
             if new_t != t:
                 run.text = new_t
-                changed = True
 
-        # 2) cross-run replace (token split across runs)
+        # Cross-run replace
         combined = "".join((r.text or "") for r in paragraph.runs)
         if "{" not in combined:
             continue
-
         new_combined = combined
         for k, v in replacements.items():
             if k in new_combined:
@@ -424,18 +593,14 @@ def _replace_tokens_in_shape(shape, replacements: Dict[str, str]) -> bool:
             paragraph.runs[0].text = new_combined
             for r in paragraph.runs[1:]:
                 r.text = ""
-            changed = True
-
-    return changed
 
 
-def replace_placeholders_in_pptx(template_path: str, output_path: str, replacements: Dict[str, str]) -> None:
+def fill_pptx(template_path: str, output_path: str, replacements: Dict[str, str], positions: List[str], preferred_foot: str) -> None:
     prs = Presentation(template_path)
-
     for slide in prs.slides:
         for shape in slide.shapes:
             _replace_tokens_in_shape(shape, replacements)
-
+        apply_position_coloring(prs, slide, positions, preferred_foot)
     prs.save(output_path)
 
 
@@ -458,26 +623,21 @@ POSITION_TO_NUMBER: Dict[str, int] = {
     "AttackingMidfield": 10,
     "DefensiveMidfield": 6,
     "CentreForward": 9,
-    # CentreBack handled dynamically (3/4)
-    "CentreBack": -1,
+    "CentreBack": -1,  # handled dynamically
+    "Centre Back": -1,
 }
+
 
 def _resolve_position_number(position: str, preferred_foot: str) -> Optional[int]:
     if position in {"CentreBack", "Centre Back"}:
         pf = (preferred_foot or "").strip().lower()
         is_left = "left" in pf or pf.startswith("l")
         return 4 if is_left else 3
-    if position in POSITION_TO_NUMBER and POSITION_TO_NUMBER[position] != -1:
-        return POSITION_TO_NUMBER[position]
-    return None
+    n = POSITION_TO_NUMBER.get(position)
+    return None if n in (None, -1) else n
 
 
-def apply_position_coloring(
-    prs: Presentation,
-    slide,
-    ordered_positions: List[str],
-    preferred_foot: str,
-) -> None:
+def apply_position_coloring(prs: Presentation, slide, ordered_positions: List[str], preferred_foot: str) -> None:
     if not ordered_positions:
         return
 
@@ -494,7 +654,7 @@ def apply_position_coloring(
     W = prs.slide_width
     H = prs.slide_height
 
-    # bottom-left area (tuned to your template screenshot)
+    # bottom-left area filter (tune if needed)
     x_max = int(W * 0.50)
     y_min = int(H * 0.55)
 
@@ -521,7 +681,7 @@ def apply_position_coloring(
 
 
 # -----------------------------
-# Replacement mapping
+# Replacements mapping
 # -----------------------------
 def build_replacements(
     player: Dict[str, Any],
@@ -554,22 +714,21 @@ def build_replacements(
 
     agency, agent = extract_agent_and_agency(player)
 
-    # Provide multiple key variants to tolerate spaces in tokens
+    # Tolerate spacing variants
     def variants(token: str) -> List[str]:
-        base = token.strip()
-        inner = base.strip("{}").strip()
-        return list({f"{{{inner}}}", f"{{ {inner} }}", base})
+        inner = token.strip("{}").strip()
+        return list({f"{{{inner}}}", f"{{ {inner} }}", token})
 
     mapping_pairs = [
         ("{Name}", name),
-        ("{ DD/MM/YYYY }", dob),        # date of birth in your template
+        ("{ DD/MM/YYYY }", dob),
         ("{Place}", place),
         ("{ Place }", place),
         ("{Nationalities}", nationalities),
-        ("{Country}", nationalities),    # if you ever used {Country}
+        ("{Country}", nationalities),
         ("{ Height }", height),
-        ("{Preferred foot}", preferred_foot),
         ("{ Preferred Foot }", preferred_foot),
+        ("{ Preferred foot }", preferred_foot),
         ("{Position}", position),
         ("{ Position }", position),
         ("{League}", league_name),
@@ -595,7 +754,6 @@ def build_replacements(
     for k, v in mapping_pairs:
         for kk in variants(k):
             out[kk] = v
-
     return out
 
 
@@ -650,34 +808,38 @@ def main() -> None:
     token = st.session_state.get("SCISPORTS_ACCESS_TOKEN", "")
     st.divider()
 
-    st.subheader("2) Select player")
+    st.subheader("2) Search & select player")
     if not token:
         st.warning("Generate the API key first.")
         st.stop()
 
-    q = st.text_input("Search player name", placeholder="e.g. Ibrahim El Kadiri")
-    c1, c2, c3 = st.columns([1, 1, 2])
-    limit = c1.selectbox("Limit", options=[25, 50, 100], index=1)
-    offset = c2.number_input("Offset", min_value=0, value=0, step=int(limit))
+    with st.form("player_search_form", clear_on_submit=False):
+        q = st.text_input("Enter player name", placeholder="e.g. Ibrahim El Kadiri", key="player_search_q")
+        submitted = st.form_submit_button("Search")
 
-    if c3.button("Search", type="secondary") or "player_options" not in st.session_state:
-        total, options = search_players(token, q, int(limit), int(offset))
-        st.session_state["player_total"] = total
-        st.session_state["player_options"] = options
+    if submitted:
+        if not q.strip():
+            st.warning("Enter a name first.")
+        else:
+            try:
+                total, options = search_players(token, q)
+                st.session_state["player_total"] = total
+                st.session_state["player_options"] = options
+            except Exception as e:
+                st.error(f"Player search failed: {e}")
 
-    total = int(st.session_state.get("player_total", 0))
     options: List[PlayerOption] = st.session_state.get("player_options", [])
-    st.caption(f"Results: showing {len(options)} of total {total} (use Offset/Limit to page)")
+    total = int(st.session_state.get("player_total", 0))
 
-    if not options:
-        st.warning("No players found. Try another search.")
+    if options:
+        st.caption(f"Results: showing {len(options)} (API limit {SEARCH_LIMIT}).")
+        selected_label = st.selectbox("Player", options=[o.label() for o in options], index=0)
+        selected = next(o for o in options if o.label() == selected_label)
+        st.session_state["selected_player_id"] = selected.player_id
+        render_player_card(selected)
+    else:
+        st.info("Search to load players.")
         st.stop()
-
-    selected_label = st.selectbox("Player", options=[o.label() for o in options], index=0)
-    selected = next(o for o in options if o.label() == selected_label)
-    st.session_state["selected_player_id"] = selected.player_id
-
-    render_player_card(selected)
 
     st.divider()
     st.subheader("3) Generate Scoutings Form")
@@ -689,46 +851,44 @@ def main() -> None:
     if st.button("Generate Scoutings Form", type="primary"):
         with st.spinner("Fetching data and generating PPTX..."):
             try:
-                player = get_player(token, selected.player_id)
-                transfer_fee = get_latest_transfer_fee(token, selected.player_id)
+                player_id = int(st.session_state["selected_player_id"])
+                player = get_player(token, player_id)
+                transfer_fee = get_latest_transfer_fee(token, player_id)
 
-                career_items = get_career_stats_all(token, selected.player_id)
-                season_stats, career_stats, latest_item = summarize_season_and_career(career_items)
+                last_season_label, last_season_stats = compute_last_season_stats(token, player_id)
+                career_stats = compute_career_totals(token, player_id)
 
                 replacements = build_replacements(
                     player=player,
                     transfer_fee=transfer_fee,
-                    season_stats=season_stats,
+                    season_stats=last_season_stats,
                     career_stats=career_stats,
                 )
 
-                prs = Presentation(TEMPLATE_PATH)
-
-                ordered_positions = (player.get("info") or {}).get("positions") or []
-                preferred_foot = _as_text(_safe_get(player, "info.preferredFoot", ""))
-
-                for slide in prs.slides:
-                    for shape in slide.shapes:
-                        _replace_tokens_in_shape(shape, replacements)
-
-                    apply_position_coloring(
-                        prs=prs,
-                        slide=slide,
-                        ordered_positions=[_as_text(p) for p in ordered_positions if p],
-                        preferred_foot=preferred_foot,
-                    )
+                positions = (player.get("info") or {}).get("positions") or []
+                preferred_foot = _as_text((player.get("info") or {}).get("preferredFoot") or "")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
                     out_path = tmp.name
-                prs.save(out_path)
+
+                fill_pptx(
+                    template_path=TEMPLATE_PATH,
+                    output_path=out_path,
+                    replacements=replacements,
+                    positions=[_as_text(p) for p in positions if p],
+                    preferred_foot=preferred_foot,
+                )
 
                 with open(out_path, "rb") as f:
                     ppt_bytes = f.read()
 
-                safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", selected.name)[:80]
-                out_filename = f"ScoutingsRapport_{safe_name}_{selected.player_id}.pptx"
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", (player.get("info") or {}).get("name") or "player")[:80]
+                out_filename = f"ScoutingsRapport_{safe_name}_{player_id}.pptx"
 
                 st.success("Generated ✅")
+                if last_season_label:
+                    st.caption(f"Last season detected: {last_season_label}")
+
                 st.download_button(
                     "Download filled Scoutings Rapport (.pptx)",
                     data=ppt_bytes,
@@ -738,13 +898,6 @@ def main() -> None:
 
                 with st.expander("Filled values (debug)"):
                     st.json(replacements)
-
-                # Helpful debug if Agency/Agent are empty
-                if not replacements.get("{Agency}") and not replacements.get("{Agent}"):
-                    st.info(
-                        "Agency/Agent came back empty. If you can point me to the exact SciSports field/endpoint "
-                        "for representation, I’ll wire it in."
-                    )
 
             except Exception as e:
                 st.error(f"Failed to generate PPTX: {e}")
